@@ -4,13 +4,7 @@ import sys
 import torch
 
 def main():
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"===== 当前MOMENT模型使用设备：{device.type} =====")
-    if device.type == "cuda":
-        print(f"GPU名称：{torch.cuda.get_device_name(0)}")
-        print(f"GPU显存占用：{torch.cuda.memory_allocated(0) / 1024 / 1024:.2f} MB")
-    else:
-        print("当前使用CPU运行")
+    
 
     config_files = [
         "random_univariate.yaml"
@@ -21,7 +15,7 @@ def main():
         config_path = os.path.join("tsfm_similarity", "experiments", "similarity", "config", config)
 
         if not os.path.exists(config_path):
-            print(f"❌ 配置文件不存在：{config_path}")
+            print(f" 配置文件不存在：{config_path}")
             continue
 
         print(f"\nRunning experiment with config: {config}")
@@ -39,7 +33,7 @@ def main():
             print("----------------------------------------")
 
         except subprocess.CalledProcessError as e:
-            print(f"\n❌ 执行配置 {config} 时出错：{e.stderr}")
+            print(f"\n 执行配置 {config} 时出错：{e.stderr}")
             print(f"Finished experiment with config: {config} (failed)")
             print("----------------------------------------")
             continue
