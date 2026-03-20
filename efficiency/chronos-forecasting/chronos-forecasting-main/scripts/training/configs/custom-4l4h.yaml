@@ -9,16 +9,17 @@ max_steps: 5000
 save_steps: 1000
 log_steps: 100
 per_device_train_batch_size: 64
-learning_rate: 0.005
+learning_rate: 0.001
 optim: adamw_torch_fused
 num_samples: 20
 shuffle_buffer_length: 10000
 gradient_accumulation_steps: 1
-model_id: "D:/new_representations/representations-in-tsfms-main/custom-chronos-4l4h"
-model_type: seq2seq
+
+model_id: "D:/new_representations/representations-in-tsfms-main/custom-gpt2-4l4h"
+model_type: causal
 random_init: true
 tie_embeddings: true
-output_dir: ./output/custom-4l4h/
+output_dir: ./output/custom-gpt2-4l4h/
 tf32: true
 torch_compile: false
 tokenizer_class: "MeanScaleUniformBins"
