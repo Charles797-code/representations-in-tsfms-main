@@ -1,178 +1,245 @@
+import os
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
-import math
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from transformers import AutoModelForCausalLM
-from transformer_lens import HookedTransformer, HookedTransformerConfig
-import transformer_lens.loading_from_pretrained as loading
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
+from transformer_lens import HookedTransformer
+
+ROOT_PATH   = r"D:\new_representations\representations-in-tsfms-main\data"
+DATA_FILE   = "ETTh1.csv"
+SEQ_LEN     = 96
+PRED_LEN    = 96
+TOTAL_LEN   = SEQ_LEN + PRED_LEN
+BATCH_SIZE  = 32
+VOCAB_SIZE  = 50257
+STRIDE      = 5
+
+DATASET_NAME = "ETTh1"
+FEATURES    = "S"
+TARGET      = "OT"
+FREQ        = "h"
+LABEL_LEN   = 0
+TRAIN_LIMIT = 5000
+TEST_LIMIT  = 2000
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+from data_provider.data_factory import data_provider
+
+class DictObj:
+    def __init__(self, in_dict: dict):
+        self.__dict__.update(in_dict)
+    def get(self, key, default=None): return self.__dict__.get(key, default)
+    def __getitem__(self, key): return self.__dict__[key]
+
+def load_ett_data():
+    args_dict = {
+        "root_path": ROOT_PATH,
+        "data_path": DATA_FILE,
+        "data": DATASET_NAME,
+        "seq_len": SEQ_LEN,
+        "label_len": LABEL_LEN,
+        "pred_len": PRED_LEN,
+        "features": FEATURES,
+        "target": TARGET,
+        "freq": FREQ,
+        "batch_size": BATCH_SIZE,
+        "embed": "timeF",
+        "num_workers": 0,
+    }
+    args = DictObj(args_dict)
+    train_set, train_loader = data_provider(args, "train")
+    test_set, test_loader   = data_provider(args, "test")
+
+    def _build_tokens(loader, desc):
+        all_data = []
+        for batch in loader:
+            seq_x = batch[0].numpy()
+            for s in seq_x:
+                if s.ndim > 1: s = s[:, 0]
+                all_data.append(s)
+        raw = np.concatenate(all_data, axis=0).astype(np.float32)
+        d_min, d_max = raw.min(), raw.max()
+
+        tokens = ((raw - d_min) / (d_max - d_min + 1e-8) * (VOCAB_SIZE - 1)).clip(0, VOCAB_SIZE - 1).astype(int)
+        samples = [tokens[i:i + TOTAL_LEN] for i in range(0, len(tokens) - TOTAL_LEN + 1, STRIDE)]
+        limit = TRAIN_LIMIT if "train" in desc else TEST_LIMIT
+        samples = samples[:limit]
+        return DataLoader(
+            TensorDataset(torch.tensor(np.array(samples), dtype=torch.long)),
+            batch_size=BATCH_SIZE, shuffle=("train" in desc)
+        ), d_min, d_max
+
+    train_loader, d_min, d_max = _build_tokens(train_loader, "train")
+    test_loader, _, _          = _build_tokens(test_loader,  "test")
+
+    scaler    = test_set.scaler
+    data_mean = float(scaler.mean_[0, 0] if scaler.mean_.ndim > 1 else scaler.mean_)
+    data_std  = float(scaler.scale_[0, 0] if scaler.scale_.ndim > 1 else scaler.scale_)
+
+    return train_loader, test_loader, d_min, d_max, data_mean, data_std
 
 
-def generate_sinusoidal_data(batch_size, seq_len, vocab_size):
-    data = []
-    for _ in range(batch_size):
-        f = np.random.uniform(10, 50)
-        a = np.random.uniform(0.5, 1.0)
-        t = np.arange(seq_len)
-        wave = a * np.sin(2 * np.pi * t / f)
-        wave_norm = (wave + 1.0) / 2.0
-        tokens = (wave_norm * (vocab_size - 1)).clip(0, vocab_size - 1).astype(int)
-        data.append(tokens)
-    return torch.tensor(np.array(data), dtype=torch.long)
+def to_continuous(tokens, d_min, d_max):
+    norm = tokens.float() / (VOCAB_SIZE - 1)
+    return norm * (d_max - d_min) + d_min
+
+def build_cosine_bias(q_len, k_len, device, period=24.0, lam=1.0, phi=0.0):
+    omega = 1.0 / period
+    q_idx = torch.arange(q_len, device=device).float().unsqueeze(1)
+    k_idx = torch.arange(k_len, device=device).float().unsqueeze(0)
+    delta_t = torch.abs(q_idx - k_idx)
+    return lam * torch.cos(2 * math.pi * omega * delta_t + phi)
 
 
-def generate_constant_data(batch_size, seq_len, vocab_size):
-    data = []
-    for _ in range(batch_size):
-        m = np.random.uniform(-0.02, 0.02)
-        b = np.random.uniform(-0.5, 0.5)
-        t = np.arange(seq_len)
-        line = m * t + b
-        line_norm = (line + 1.0) / 2.0
-        tokens = (line_norm * (vocab_size - 1)).clip(0, vocab_size - 1).astype(int)
-        data.append(tokens)
-    return torch.tensor(np.array(data), dtype=torch.long)
+def run_inference(model, data_loader, d_min, d_max, biased_heads=None, period=24.0, lam=1.0, phi=0.0):
+    model.reset_hooks()
+    hook_fns = []
+    if biased_heads:
+        def make_hook(layer, head):
+            cache = {}
+            def fn(attn_scores, hook):
+                b, n_h, q_len, k_len = attn_scores.shape
+                if q_len not in cache:
+                    cache[q_len] = build_cosine_bias(q_len, k_len, model.cfg.device, period, lam, phi)
+                attn_scores[:, head, :, :] += cache[q_len]
+                return attn_scores
+            return fn
+        for (l, h) in biased_heads:
+            model.add_hook(f"blocks.{l}.attn.hook_attn_scores", make_hook(l, h))
+
+    total_mse, total_mae = 0.0, 0.0
+    n_batches = 0
+    sample_targets, sample_preds = None, None
+
+    for batch in data_loader:
+        batch = batch[0].to(model.cfg.device)   # [batch, 192]
+        inputs  = batch[:, :-1]                  # [batch, 191] -> predict next token
+        targets = batch[:, 1:]                   # [batch, 191]
+
+        with torch.no_grad():
+            logits = model(inputs)
+            preds_tokens = torch.argmax(logits[:, -PRED_LEN:, :], dim=-1)  # [batch, 96]
+            targets_slice = targets[:, -PRED_LEN:]  # [batch, 96]
+
+            targets_cont = to_continuous(targets_slice, d_min, d_max)   # [batch, 96]
+            preds_cont    = to_continuous(preds_tokens, d_min, d_max)    # [batch, 96]
+
+            total_mse += F.mse_loss(preds_cont, targets_cont).item()
+            total_mae += F.l1_loss(preds_cont, targets_cont).item()
+            n_batches += 1
+
+            if sample_targets is None:
+                sample_targets = targets_cont[0].cpu().numpy()
+                sample_preds   = preds_cont[0].cpu().numpy()
+
+    model.reset_hooks()
+    return total_mse / n_batches, total_mae / n_batches, sample_targets, sample_preds
 
 
-def tokens_to_continuous_data(tokens, vocab_size):
-    wave_norm = tokens.float() / (vocab_size - 1)
-    return (wave_norm * 2.0) - 1.0
-
-
-def main():
-    model_path = r"D:\new_representations\representations-in-tsfms-main\output\custom-gpt2-4l4h\run-3\checkpoint-final"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    hf_model = AutoModelForCausalLM.from_pretrained(model_path)
-    cfg = HookedTransformerConfig(
-        n_layers=4, n_heads=4, d_model=256, d_head=64,
-        d_vocab=4096, d_mlp=1024, n_ctx=1024, act_fn="gelu_new",
-        normalization_type="LN",
-        use_attn_result=True
-    )
-    model = HookedTransformer(cfg)
-    model.load_state_dict(loading.convert_gpt2_weights(hf_model, cfg), strict=False)
-    model.to(device)
-
-    vocab_size = 4096
-
-    search_seq_len = 64
-    sin_tokens = generate_sinusoidal_data(50, search_seq_len, vocab_size).to(device)
-    const_tokens = generate_constant_data(50, search_seq_len, vocab_size).to(device)
-    all_tokens = torch.cat([sin_tokens, const_tokens], dim=0)
-    labels = np.array([1] * 50 + [0] * 50)
-
-    _, search_cache = model.run_with_cache(all_tokens)
-    target_token_idx = search_seq_len - 1
-
-    global_best_ldr = -1.0
-    global_best_layer = -1
-    global_best_head = -1
-
-    for l in range(1, cfg.n_layers):
-        layer_results = search_cache["result", l]
-        for h in range(cfg.n_heads):
-            X = layer_results[:, target_token_idx, h, :].cpu().numpy()
-            y = labels
-            lda = LinearDiscriminantAnalysis(n_components=1)
-            try:
-                X_proj = lda.fit_transform(X, y).flatten()
-                mu_s, mu_c = X_proj[y == 1].mean(), X_proj[y == 0].mean()
-                var_s, var_c = X_proj[y == 1].var(), X_proj[y == 0].var()
-                ldr_score = ((mu_s - mu_c) ** 2) / (var_s + var_c + 1e-8)
-            except:
-                ldr_score = 0.0
-
-            if ldr_score > global_best_ldr:
-                global_best_ldr = ldr_score
-                global_best_layer = l
-                global_best_head = h
-
-
-
-    test_seq_len = 256
-
-    true_period = 30.0
-
-    t_test = np.arange(test_seq_len)
-    wave_test = 0.8 * np.sin(2 * np.pi * t_test / true_period)
-    wave_norm_test = (wave_test + 1.0) / 2.0
-    tokens_test = (wave_norm_test * (vocab_size - 1)).clip(0, vocab_size - 1).astype(int)
-    periodic_test = torch.tensor(np.array([tokens_test]), dtype=torch.long).to(device)
-
-    targets_tokens = periodic_test[0, 1:]
-    targets_cont = tokens_to_continuous_data(targets_tokens, vocab_size)
-
-
-    empirical_omega = 1.0 / true_period
-    empirical_lambda = 0.8
-    empirical_phi = 0.8
-
-
-    print("\n[3] 验证测试：对比 Normal 和 经验 Resonance")
-
-    # 1. 正常推理 (Baseline)
-    normal_logits = model(periodic_test)
-    preds_normal_tokens = torch.argmax(normal_logits[0, :-1], dim=-1)
-    preds_normal_cont = tokens_to_continuous_data(preds_normal_tokens, vocab_size)
-    mse_normal = F.mse_loss(preds_normal_cont, targets_cont)
-    mae_normal = F.l1_loss(preds_normal_cont, targets_cont)
-
-
-    def empirical_resonance_hook(value, hook):
-        q_len, k_len = value.shape[-2], value.shape[-1]
-        q_idx = torch.arange(q_len, device=value.device).unsqueeze(1)
-        k_idx = torch.arange(k_len, device=value.device).unsqueeze(0)
-        delta_t = torch.abs(q_idx - k_idx).float()
-
-
-        bias = empirical_lambda * torch.cos(2 * math.pi * empirical_omega * delta_t + empirical_phi)
-
-
-        new_value = value.clone()
-        new_value[:, global_best_head, :, :] = new_value[:, global_best_head, :, :] + bias
-        return new_value
-
-    hook_attn_name = f"blocks.{global_best_layer}.attn.hook_attn_scores"
-    model.add_hook(hook_attn_name, empirical_resonance_hook)
-
-
-    resonant_logits = model(periodic_test)
-    preds_resonant_tokens = torch.argmax(resonant_logits[0, :-1], dim=-1)
-    preds_resonant_cont = tokens_to_continuous_data(preds_resonant_tokens, vocab_size)
-
-    mse_resonant = F.mse_loss(preds_resonant_cont, targets_cont)
-    mae_resonant = F.l1_loss(preds_resonant_cont, targets_cont)
+def plot_heatmap_all(model, batch_tokens, n_layers, n_heads, title, highlighted=None,
+                     biased_heads=None, period=24.0, lam=1.0, phi=0.0):
     model.reset_hooks()
 
+    if biased_heads:
+        def make_hook(layer, head):
+            cache = {}
+            def fn(attn_scores, hook):
+                b, n_h, q_len, k_len = attn_scores.shape
+                if q_len not in cache:
+                    cache[q_len] = build_cosine_bias(q_len, k_len, model.cfg.device, period, lam, phi)
+                attn_scores[:, head, :, :] += cache[q_len]
+                return attn_scores
+            return fn
+        for (l, h) in biased_heads:
+            model.add_hook(f"blocks.{l}.attn.hook_attn_scores", make_hook(l, h))
 
-    print(f"\n正常推理:")
-    print(f"   MSE: {mse_normal.item():.6f} | MAE: {mae_normal.item():.6f}")
+    _, cache = model.run_with_cache(batch_tokens, names_filter=lambda n: "pattern" in n)
 
-    print(f"\nEmpirical Resonance:")
-    print(f"   MSE: {mse_resonant.item():.6f} | MAE: {mae_resonant.item():.6f}")
+    fig, axes = plt.subplots(n_layers, n_heads,
+                              figsize=(n_heads * 1.8 + 1, n_layers * 1.8 + 1),
+                              squeeze=False)
+    fig.suptitle(title, fontsize=14)
 
-    mse_decrease = (mse_normal.item() - mse_resonant.item()) / (mse_normal.item() + 1e-8) * 100
+    for l in range(n_layers):
+        for h in range(n_heads):
+            ax  = axes[l][h]
+            attn = cache["pattern", l][0, h].cpu().numpy()
+            ax.imshow(attn, aspect="auto", cmap="viridis", vmin=0, vmax=0.5)
+            is_bias = highlighted and (l, h) in highlighted
+            ax.set_title(f"L{l}H{h}" + (" ←" if is_bias else ""), fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if is_bias:
+                for spine in ax.spines.values():
+                    spine.set_edgecolor("red")
+                    spine.set_linewidth(2)
+
+    plt.tight_layout()
+    plt.show()
+    model.reset_hooks()
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = HookedTransformer.from_pretrained("gpt2", device=device)
+    model.eval()
+
+    n_layers = model.cfg.n_layers   # 12
+    n_heads  = model.cfg.n_heads    # 12
+    print(f"模型: GPT-2 Small | {n_layers}层 × {n_heads}头")
+
+    train_loader, test_loader, d_min, d_max, data_mean, data_std = load_ett_data()
+    print(f"数据: Train={len(train_loader.dataset)}, Test={len(test_loader.dataset)}")
 
 
-    plot_len = 100
-    t_steps = np.arange(plot_len)
-    y_true = targets_cont[-plot_len:].cpu().numpy()
-    y_norm = preds_normal_cont[-plot_len:].cpu().numpy()
-    y_res = preds_resonant_cont[-plot_len:].cpu().numpy()
+    sample_batch = next(iter(test_loader))[0][:4].to(device)
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(t_steps, y_true, label="True Sinusoid Target", color="black", linewidth=2, linestyle="--")
-    plt.plot(t_steps, y_norm, label=f"Normal Predict (MSE: {mse_normal.item():.2f})", color="blue", alpha=0.7)
-    plt.plot(t_steps, y_res, label=f"Empirical Resonant Guided (MSE: {mse_resonant.item():.2f})", color="green",
-             alpha=0.9)
+    mse_norm, mae_norm, t_norm, p_norm = run_inference(model, test_loader, d_min, d_max)
+    print(f"  MSE = {mse_norm:.4f}   MAE = {mae_norm:.4f}")
 
-    plt.title("Empirical Resonance Attention: Using True Physical Priors")
-    plt.xlabel("Time Steps")
-    plt.ylabel("Continuous Value")
+    biased_heads = list(set([
+        (0, 1), (0, 5), (0, 10), (1, 11), (3, 0),
+        (5, 1), (5, 5), (6, 9), (7, 1), (7, 10),
+        (8, 1), (8, 6), (9, 6), (9, 9), (10, 1),
+        (10, 6), (11, 9), (11, 8), (10, 10), (10, 11),
+    ]))
+
+    lam = 1.0
+    phi = 0.0
+
+    mse_bias, mae_bias, t_bias, p_bias = None, None, None, None
+    if biased_heads:
+        mse_bias, mae_bias, t_bias, p_bias = run_inference(
+            model, test_loader, d_min, d_max,
+            biased_heads=biased_heads, period=24.0, lam=lam, phi=phi
+        )
+        print(f"  MSE = {mse_bias:.4f}   MAE = {mae_bias:.4f}")
+
+    if biased_heads:
+        label = f"Cosine Bias {biased_heads} (p=24h)"
+        print(f"{label:<40} {mse_bias:>10.4f} {mae_bias:>10.4f}")
+
+
+    n_plot = min(200, len(t_norm))
+    steps = np.arange(n_plot)
+
+    plt.figure(figsize=(14, 5))
+    plt.plot(steps, t_norm[-n_plot:], label="Ground Truth",
+             color="black", linewidth=2, linestyle="--")
+    plt.plot(steps, p_norm[-n_plot:], label=f"Normal (MSE={mse_norm:.3f})",
+             color="steelblue", alpha=0.85)
+    if biased_heads:
+        plt.plot(steps, p_bias[-n_plot:], label=f"Cosine Bias (MSE={mse_bias:.3f})",
+                 color="orange", linewidth=2)
+    plt.title("ETTH1 Prediction — Normal vs Cosine Bias (period=24h)")
+    plt.xlabel("Time Step")
+    plt.ylabel("Value")
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
 
