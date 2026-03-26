@@ -29,23 +29,33 @@ np.random.seed(42)
 
 from data_provider.data_factory import data_provider
 
+DATASETS = {
+    "ETTh1":      {"data": "ETTh1",      "data_path": "ETTh1.csv",      "features": "S", "target": "OT", "freq": "h", "use_all": False},
+    "ETTh2":      {"data": "ETTh2",      "data_path": "ETTh2.csv",      "features": "S", "target": "OT", "freq": "h", "use_all": False},
+    "ETTm1":      {"data": "ETTm1",      "data_path": "ETTm1.csv",      "features": "S", "target": "OT", "freq": "t", "use_all": True},
+    "ETTm2":      {"data": "ETTm2",      "data_path": "ETTm2.csv",      "features": "S", "target": "OT", "freq": "t", "use_all": False},
+    "traffic":    {"data": "custom",     "data_path": "traffic.csv",    "features": "M", "target": "OT", "freq": "h", "use_all": False},
+    "weather":    {"data": "custom",     "data_path": "weather.csv",    "features": "M", "target": "OT", "freq": "h", "use_all": False},
+    "electricity":{"data": "custom",     "data_path": "electricity.csv","features": "M", "target": "OT", "freq": "h", "use_all": False},
+}
+
 class DictObj:
     def __init__(self, in_dict: dict):
         self.__dict__.update(in_dict)
     def get(self, key, default=None): return self.__dict__.get(key, default)
     def __getitem__(self, key): return self.__dict__[key]
 
-def load_ett_data():
+def load_dataset(dataset_name, ds_config, **kwargs):
     args_dict = {
         "root_path": ROOT_PATH,
-        "data_path": DATA_FILE,
-        "data": DATASET_NAME,
+        "data_path": ds_config["data_path"],
+        "data": ds_config["data"],
         "seq_len": SEQ_LEN,
         "label_len": LABEL_LEN,
         "pred_len": PRED_LEN,
-        "features": FEATURES,
-        "target": TARGET,
-        "freq": FREQ,
+        "features": ds_config["features"],
+        "target": ds_config["target"],
+        "freq": ds_config["freq"],
         "batch_size": BATCH_SIZE,
         "embed": "timeF",
         "num_workers": 0,
@@ -54,7 +64,7 @@ def load_ett_data():
     train_set, train_loader = data_provider(args, "train")
     test_set, test_loader   = data_provider(args, "test")
 
-    def _build_tokens(loader, desc):
+    def _build_tokens(loader, desc, use_all=False):
         all_data = []
         for batch in loader:
             seq_x = batch[0].numpy()
@@ -66,15 +76,17 @@ def load_ett_data():
 
         tokens = ((raw - d_min) / (d_max - d_min + 1e-8) * (VOCAB_SIZE - 1)).clip(0, VOCAB_SIZE - 1).astype(int)
         samples = [tokens[i:i + TOTAL_LEN] for i in range(0, len(tokens) - TOTAL_LEN + 1, STRIDE)]
-        limit = TRAIN_LIMIT if "train" in desc else TEST_LIMIT
-        samples = samples[:limit]
+        if not use_all:
+            limit = TRAIN_LIMIT if "train" in desc else TEST_LIMIT
+            samples = samples[:limit]
         return DataLoader(
             TensorDataset(torch.tensor(np.array(samples), dtype=torch.long)),
             batch_size=BATCH_SIZE, shuffle=("train" in desc)
         ), d_min, d_max
 
-    train_loader, d_min, d_max = _build_tokens(train_loader, "train")
-    test_loader, _, _          = _build_tokens(test_loader,  "test")
+    use_all = kwargs.get("use_all", False)
+    train_loader, d_min, d_max = _build_tokens(train_loader, "train", use_all)
+    test_loader, _, _          = _build_tokens(test_loader,  "test",  use_all)
 
     scaler    = test_set.scaler
     data_mean = float(scaler.mean_[0, 0] if scaler.mean_.ndim > 1 else scaler.mean_)
@@ -190,16 +202,8 @@ def main():
 
     n_layers = model.cfg.n_layers   # 12
     n_heads  = model.cfg.n_heads    # 12
-    print(f"模型: GPT-2 Small | {n_layers}层 × {n_heads}头")
-
-    train_loader, test_loader, d_min, d_max, data_mean, data_std = load_ett_data()
-    print(f"数据: Train={len(train_loader.dataset)}, Test={len(test_loader.dataset)}")
-
-
-    sample_batch = next(iter(test_loader))[0][:4].to(device)
-
-    mse_norm, mae_norm, t_norm, p_norm = run_inference(model, test_loader, d_min, d_max)
-    print(f"  MSE = {mse_norm:.4f}   MAE = {mae_norm:.4f}")
+    print(f"Model: GPT-2 Small | {n_layers} layers x {n_heads} heads")
+    print("=" * 70)
 
     biased_heads = list(set([
         (0, 1), (0, 5), (0, 10), (1, 11), (3, 0),
@@ -207,41 +211,49 @@ def main():
         (8, 1), (8, 6), (9, 6), (9, 9), (10, 1),
         (10, 6), (11, 9), (11, 8), (10, 10), (10, 11),
     ]))
-
     lam = 1.0
     phi = 0.0
 
-    mse_bias, mae_bias, t_bias, p_bias = None, None, None, None
-    if biased_heads:
-        mse_bias, mae_bias, t_bias, p_bias = run_inference(
+    header = f"{'Dataset':<14} {'Normal MSE':>12} {'Normal MAE':>12} {'Bias MSE':>12} {'Bias MAE':>12} {'MSE↓%':>8}"
+    print(header)
+    print("-" * 70)
+
+    all_results = {}
+
+    for ds_name, ds_config in DATASETS.items():
+        print(f"\n[Loading {ds_name}...]")
+        try:
+            train_loader, test_loader, d_min, d_max, data_mean, data_std = load_dataset(ds_name, ds_config, use_all=ds_config.get("use_all", False))
+        except Exception as e:
+            print(f"  [SKIP] {ds_name}: {e}")
+            continue
+
+        print(f"  Test samples: {len(test_loader.dataset)}")
+
+        mse_norm, mae_norm, _, _ = run_inference(model, test_loader, d_min, d_max)
+        mse_bias, mae_bias, _, _ = run_inference(
             model, test_loader, d_min, d_max,
             biased_heads=biased_heads, period=24.0, lam=lam, phi=phi
         )
-        print(f"  MSE = {mse_bias:.4f}   MAE = {mae_bias:.4f}")
 
-    if biased_heads:
-        label = f"Cosine Bias {biased_heads} (p=24h)"
-        print(f"{label:<40} {mse_bias:>10.4f} {mae_bias:>10.4f}")
+        mse_decrease = (mse_norm - mse_bias) / (mse_norm + 1e-8) * 100
 
+        print(f"{ds_name:<14} {mse_norm:>12.4f} {mae_norm:>12.4f} {mse_bias:>12.4f} {mae_bias:>12.4f} {mse_decrease:>8.2f}%")
 
-    n_plot = min(200, len(t_norm))
-    steps = np.arange(n_plot)
+        all_results[ds_name] = {
+            "mse_norm": mse_norm, "mae_norm": mae_norm,
+            "mse_bias": mse_bias, "mae_bias": mae_bias,
+            "mse_decrease": mse_decrease,
+        }
 
-    plt.figure(figsize=(14, 5))
-    plt.plot(steps, t_norm[-n_plot:], label="Ground Truth",
-             color="black", linewidth=2, linestyle="--")
-    plt.plot(steps, p_norm[-n_plot:], label=f"Normal (MSE={mse_norm:.3f})",
-             color="steelblue", alpha=0.85)
-    if biased_heads:
-        plt.plot(steps, p_bias[-n_plot:], label=f"Cosine Bias (MSE={mse_bias:.3f})",
-                 color="orange", linewidth=2)
-    plt.title("ETTH1 Prediction — Normal vs Cosine Bias (period=24h)")
-    plt.xlabel("Time Step")
-    plt.ylabel("Value")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
+    print("=" * 70)
+    print("\nSummary (sorted by MSE decrease):")
+    print("-" * 55)
+    sorted_results = sorted(all_results.items(), key=lambda x: x[1]["mse_decrease"], reverse=True)
+    for ds_name, r in sorted_results:
+        marker = "✓" if r["mse_decrease"] > 0 else "✗"
+        print(f"  {marker} {ds_name:<14}  MSE↓ {r['mse_decrease']:>6.2f}%  "
+              f"({r['mse_norm']:.4f} → {r['mse_bias']:.4f})")
 
 
 if __name__ == "__main__":
